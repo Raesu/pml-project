@@ -1,0 +1,157 @@
+---
+title: "PML Final Project"
+author: "Ryan Summe"
+date: "2024-04-19"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r Setup}
+library(tidyverse)
+library(tidymodels)
+library(corrr)
+```
+
+### Import Data
+Import training and test data sets. Automatically infer data types.
+
+```{r Import Data}
+# Add #DIV/0! as an NA value since it is in the CSV
+training <- read_csv('Data/pml-training.csv', show_col_types=FALSE, na=c('','NA','#DIV/0!'))
+test <- read_csv('Data/pml-testing.csv', show_col_types=FALSE)
+
+```
+
+### Data Review
+Training set is `19622` rows by `160` columns. There are many numeric variables related to the gyroscopes and accelerometers, which is very difficult to read directly. There are usernames, timestamps, and several factor-looking variables like `new_window`, `num_window`, and `classe`. `classe` is the variable we are trying to predict.
+
+There are 6 users, and 20 unique timestamps. I am converting the `cvtd_timestamp` to a date format so that I can test it in my feature tuning. Also remove the first column as it is just row numbers. There are raw numerical timestamp columns (`part_1` and `part_2`) that can likely be used in the model instead of dealing with the date time conversion.
+
+There are 5 different levels of `classe`.
+
+```{r EDA}
+
+training |> count(user_name)
+training |> count(cvtd_timestamp)
+training |> count(classe)
+
+# Inspect non-numeric variables to see if there are importing errors
+# Some columns are all NA which should be dropped
+training |> select(-where(is.numeric)) |> summary()
+
+# All logical columns are NA
+training <- training |> select(-where(is_logical))
+
+training <- training |> mutate(cvtd_timestamp=dmy_hm(cvtd_timestamp)) |> select(-1)
+test <- test |> mutate(cvtd_timestamp=dmy_hm(cvtd_timestamp)) |> select(-1)
+# There are many variables that look to be calculated off of other columns (min, max, avg) but
+# they are frequently NA. I'm removing these so that our training data has more complete
+# cases for model training.
+naColumnNames <- training |> slice(1) |> select(where(~all(is.na(.x)))) |> names()
+training <- training |> select(-all_of(naColumnNames)) |> na.omit()
+```
+
+### Check Correlations
+Create correlation matrix to get an idea of how variables are correlated. Select numeric columns, correlate, drop reciprocal correlations (X:Y vs Y:X), and turn into a long data frame sorted by r.
+
+Many variables are highly correlated with 4 pairs at `0.99` r. There seem to be variables based on the same measurement, ie `pitch_belt` and `avg_pitch_belt`. I will use PCA to reduce the number of dimensions and interdependence prior to running a model.
+
+```{r Correlation}
+training |>
+  select(where(is.numeric)) |>
+  correlate() |> shave() |>
+  stretch(na.rm=TRUE) |> arrange(-r)
+```
+
+### Create TidyModels Recipe
+Use `tidymodels` to design a recipe for ingesting training data and applying several steps of feature engineering. This includes identifying ID columns, creating dummy variables for nominal variables, removing zero variance predictors, and centering and scaling predictors.
+
+Once feature engineering is done, apply Principal Component Analysis to reduce dimensionality. Visualize our principal components.
+
+```{r}
+
+rec <- recipe(classe ~ ., data=training) |>
+  # Set username and timestamp as IDs. There are numerical timestamps
+  update_role(user_name, cvtd_timestamp, new_role='ID') |>
+  # Create dummy variable for new_window
+  step_dummy(new_window) |>
+  # Remove variables with zero variance
+  step_zv(all_predictors()) |>
+  # Normalize (center and scale) predictors
+  step_normalize(all_predictors()) |>
+  step_pca(all_predictors())
+
+rec_noPCA <- recipe(classe ~ ., data=training) |>
+  update_role(user_name, cvtd_timestamp, new_role='ID') |>
+  step_dummy(new_window) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_predictors())
+
+# Visualize First 5 Components
+prep(rec) |> tidy(4) |>
+  filter(component %in% paste0('PC', 1:5)) |>
+  mutate(component=fct_inorder(component)) |>
+  ggplot(aes(value, terms, fill=terms)) + geom_col(show.legend=FALSE) +
+  facet_wrap(~component, nrow=1) + labs(y=NULL, title='Top 5 Principal Components')
+
+```
+
+### Create TidyModels Model & Workflow
+I will first use a decision tree to attempt classifying the `classe` variable.
+
+```{r}
+
+wflow <- workflow() |>
+  add_model(decision_tree(mode='classification')) |>
+  add_recipe(rec)
+
+wflowNoPCA <- workflow() |> 
+  add_model(decision_tree(mode='classification')) |>
+  add_recipe(rec_noPCA)
+
+wflowNoPCA_SVM <- workflow() |>
+  add_model(svm_linear(mode='classification')) |>
+  add_recipe(rec_noPCA)
+
+fit <- wflow |> fit(data=training)
+fitNoPCA <- wflowNoPCA |> fit(data=training)
+fitNoPCA_SVM <- wflowNoPCA_SVM |> fit(data=training)
+```
+
+### Use Testing Data to Assess Performance
+Using the model with PCA, my prediction accuracy was 60% according to the prediction quiz.
+
+Without PCA, my accuracy improved to 70%. By switching my model to a linear SVM classifier, I was able to get 90% on the prediction quiz.
+
+I would like to create an ROC AUC chart, but it isn't possible since we don't have the true `classe` variable available in the test data set.
+
+As for an estimate on out of sample error, it looks like it would be 10% based on my performance using the Linear SVM model without PCA.
+
+```{r}
+# With PCA
+fit |> predict(test)
+
+# Without PCA
+fitNoPCA |> predict(test)
+
+# SVM Without PCA
+fitNoPCA_SVM |> predict(test)
+
+```
+
+### Cross Validation
+I ran cross validation on the training set using the decision tree with no PCA (the linear SVM model was extremely resource intensive for my computer). Based on 10-fold CV, the accuracy is 0.83 and the ROC AUC is 0.95 which is quite good.
+
+```{r}
+
+set.seed(123)
+# Set 10 sesgments of the training data for 10-fold Cross Validation
+folds <- vfold_cv(training, v=10)
+
+crossValidation <- wflowNoPCA |> fit_resamples(folds)
+
+# View metrics
+collect_metrics(crossValidation)
+
+```
